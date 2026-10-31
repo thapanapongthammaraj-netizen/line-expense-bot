@@ -1,24 +1,22 @@
-import os, re, hmac, hashlib, base64, json, datetime as dt
+import os, re, hmac, hashlib, base64, json, secrets, datetime as dt
 from zoneinfo import ZoneInfo
 import requests, psycopg2
-from flask import Flask, request, abort
+from flask import Flask, request, abort, Response
 
 app = Flask(__name__)
 TZ = ZoneInfo("Asia/Bangkok")
 SECRET = os.environ["LINE_CHANNEL_SECRET"]
 TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-AI_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_URL = os.environ["DATABASE_URL"]
 OWNER = os.environ.get("ALLOWED_USER_ID", "")
+BASE = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL", "")
 H = {"Authorization": "Bearer " + TOKEN}
 NAME = {"cash": "เงินสด", "transfer": "เงินโอน"}
 W = {"สด": "cash", "โอน": "transfer"}
 AMT = r"([\d,]+(?:\.\d+)?)\s*(?:บาท|฿)?$"
 RE_IN = re.compile(r"^รับเงิน(สด|โอน)\s*(.*?)\s*" + AMT)
 RE_OUT = re.compile(r"^จ่ายเงิน(สด|โอน)\s*(.*?)\s*" + AMT)
-PROMPT = ('This image may be a Thai bank transfer slip or payment receipt. Reply with JSON only: '
-          '{"is_slip": true or false, "amount": number, "merchant": "recipient or shop name"}. '
-          'If it is not a slip or receipt, set is_slip to false.')
+RE_PIC = re.compile(r"^ดูรูป\s*#?(\d+)$")
 
 
 def q(sql, args=()):
@@ -33,6 +31,9 @@ def q(sql, args=()):
 
 q("""CREATE TABLE IF NOT EXISTS tx(id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(),
      kind TEXT, wallet TEXT, amount NUMERIC, note TEXT)""")
+q("ALTER TABLE tx ADD COLUMN IF NOT EXISTS img_id INT")
+q("""CREATE TABLE IF NOT EXISTS img(id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(),
+     data BYTEA, ctype TEXT, token TEXT, used BOOLEAN DEFAULT false)""")
 
 
 def m(x):
@@ -55,9 +56,17 @@ def bal_text():
 
 
 def add(kind, wallet, amount, note):
-    q("INSERT INTO tx(kind,wallet,amount,note) VALUES(%s,%s,%s,%s)", (kind, wallet, amount, note))
+    r = q("SELECT id FROM img WHERE used=false AND ts > now() - interval '15 minutes' "
+          "ORDER BY id DESC LIMIT 1")
+    img = r[0][0] if r else None
+    if img:
+        q("UPDATE img SET used=true WHERE id=%s", (img,))
+    tid = q("INSERT INTO tx(kind,wallet,amount,note,img_id) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+            (kind, wallet, amount, note, img))[0][0]
     sign = "รับ" if kind == "in" else "จ่าย"
-    return f"บันทึกแล้ว: {sign}{NAME[wallet]} {m(amount)}฿ ({note})\n\nคงเหลือ\n{bal_text()}"
+    pic = "\n📷 แนบรูปแล้ว" if img else ""
+    return (f"บันทึกแล้ว #{tid}: {sign}{NAME[wallet]} {m(amount)}฿ ({note}){pic}"
+            f"\n\nคงเหลือ\n{bal_text()}")
 
 
 def summary(month):
@@ -71,30 +80,29 @@ def summary(month):
     t = f"สรุป{title}\nรับ {m(inc)}฿ | จ่าย {m(out)}฿ | สุทธิ {m(inc - out)}฿\n"
     t += f"- จ่ายเงินสด {m(d.get(('out', 'cash'), 0))}฿\n- จ่ายเงินโอน {m(d.get(('out', 'transfer'), 0))}฿"
     if not month:
-        items = q("SELECT ts, kind, wallet, amount, note FROM tx WHERE ts >= %s ORDER BY ts", (start,))
+        items = q("SELECT id, ts, kind, wallet, amount, note, img_id FROM tx "
+                  "WHERE ts >= %s ORDER BY ts", (start,))
         if items:
             t += "\n\nรายการ\n" + "\n".join(
-                f"{r[0].astimezone(TZ):%H:%M} {'+' if r[1] == 'in' else '-'}{m(r[3])} {NAME[r[2]]} {r[4]}"
-                for r in items)
+                f"#{r[0]} {r[1].astimezone(TZ):%H:%M} {'+' if r[2] == 'in' else '-'}{m(r[4])} "
+                f"{NAME[r[3]]} {r[5]}{' 📷' if r[6] else ''}" for r in items)
+            t += "\n\nดูรูป: พิมพ์ ดูรูป #เลขรายการ"
     return t
-
-
-def read_slip(msg_id):
-    r = requests.get(f"https://api-data.line.me/v2/bot/message/{msg_id}/content", headers=H, timeout=20)
-    r.raise_for_status()
-    mt = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-    body = {"model": "claude-haiku-5-5", "max_tokens": 200, "messages": [{"role": "user", "content": [
-        {"type": "image", "source": {"type": "base64", "media_type": mt,
-                                     "data": base64.b64encode(r.content).decode()}},
-        {"type": "text", "text": PROMPT}]}]}
-    a = requests.post("https://api.anthropic.com/v1/messages", timeout=60, json=body,
-                      headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01"}).json()
-    return json.loads(re.search(r"\{.*\}", a["content"][0]["text"], re.S).group())
 
 
 def reply(tok, text):
     requests.post("https://api.line.me/v2/bot/message/reply", headers=H, timeout=15,
                   json={"replyToken": tok, "messages": [{"type": "text", "text": text[:4900]}]})
+
+
+def show_pic(tok, n):
+    r = q("SELECT i.token FROM tx t JOIN img i ON i.id = t.img_id WHERE t.id=%s", (n,))
+    if not r:
+        return reply(tok, "รายการนี้ไม่มีรูปแนบ")
+    url = f"{BASE}/img/{r[0][0]}"
+    requests.post("https://api.line.me/v2/bot/message/reply", headers=H, timeout=15,
+                  json={"replyToken": tok, "messages": [
+                      {"type": "image", "originalContentUrl": url, "previewImageUrl": url}]})
 
 
 def handle(e):
@@ -111,21 +119,28 @@ def handle(e):
             if mt:
                 note = mt.group(2) or ("รายรับ" if kind == "in" else "รายจ่าย")
                 return reply(tok, add(kind, W[mt.group(1)], float(mt.group(3).replace(",", "")), note))
+        mp = RE_PIC.match(t)
+        if mp:
+            return show_pic(tok, int(mp.group(1)))
         if "ยอดคงเหลือ" in t:
             return reply(tok, bal_text())
         if "สรุปเดือน" in t:
             return reply(tok, summary(True))
         if "รายการวันนี้" in t or "สรุปวันนี้" in t:
             return reply(tok, summary(False))
-        return reply(tok, "คำสั่งที่ใช้ได้\n- ส่งรูปสลิป (จ่ายเงินโอน)\n- จ่ายเงินสด ข้าวไข่เจียว 50บาท\n"
-                          "- รับเงินโอน 100บาท / รับเงินสด 500บาท\n- ยอดคงเหลือ\n- รายการวันนี้\n- สรุปเดือนนี้")
+        return reply(tok, "คำสั่งที่ใช้ได้\n- ส่งรูป แล้วพิมพ์ต่อ เช่น\n  จ่ายเงินโอน ค่าข้าว 120\n"
+                          "  จ่ายเงินสด ข้าวไข่เจียว 50\n- รับเงินโอน 100 / รับเงินสด 500\n"
+                          "- ยอดคงเหลือ\n- รายการวันนี้\n- สรุปเดือนนี้\n- ดูรูป #เลขรายการ")
     if msg["type"] == "image":
         if OWNER and uid != OWNER:
             return
-        s = read_slip(msg["id"])
-        if not s.get("is_slip") or not s.get("amount"):
-            return reply(tok, "อ่านเป็นสลิปไม่ได้ ถ้าเป็นเงินสดให้พิมพ์ เช่น\nจ่ายเงินสด ข้าวไข่เจียว 50บาท")
-        return reply(tok, add("out", "transfer", float(s["amount"]), s.get("merchant") or "สลิป"))
+        r = requests.get(f"https://api-data.line.me/v2/bot/message/{msg['id']}/content",
+                         headers=H, timeout=20)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        q("INSERT INTO img(data, ctype, token) VALUES(%s,%s,%s)",
+          (psycopg2.Binary(r.content), ct, secrets.token_urlsafe(16)))
+        return reply(tok, "เก็บรูปแล้ว ✅\nพิมพ์รายการต่อภายใน 15 นาที เช่น\nจ่ายเงินโอน ค่าข้าว 120")
 
 
 @app.post("/callback")
@@ -143,6 +158,14 @@ def callback():
             print("error:", ex)
             reply(e["replyToken"], "เกิดข้อผิดพลาด ลองส่งใหม่อีกครั้งนะ")
     return "ok"
+
+
+@app.get("/img/<token>")
+def get_img(token):
+    r = q("SELECT data, ctype FROM img WHERE token=%s", (token,))
+    if not r:
+        abort(404)
+    return Response(bytes(r[0][0]), mimetype=r[0][1])
 
 
 @app.get("/")
