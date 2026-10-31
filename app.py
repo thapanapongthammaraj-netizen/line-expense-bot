@@ -8,7 +8,7 @@ TZ = ZoneInfo("Asia/Bangkok")
 SECRET = os.environ["LINE_CHANNEL_SECRET"]
 TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 DB_URL = os.environ["DATABASE_URL"]
-OWNER = os.environ.get("ALLOWED_USER_ID", "")
+KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "90"))
 BASE = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL", "")
 H = {"Authorization": "Bearer " + TOKEN}
 NAME = {"cash": "เงินสด", "transfer": "เงินโอน"}
@@ -32,8 +32,10 @@ def q(sql, args=()):
 q("""CREATE TABLE IF NOT EXISTS tx(id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(),
      kind TEXT, wallet TEXT, amount NUMERIC, note TEXT)""")
 q("ALTER TABLE tx ADD COLUMN IF NOT EXISTS img_id INT")
+q("ALTER TABLE tx ADD COLUMN IF NOT EXISTS user_id TEXT")
 q("""CREATE TABLE IF NOT EXISTS img(id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(),
      data BYTEA, ctype TEXT, token TEXT, used BOOLEAN DEFAULT false)""")
+q("ALTER TABLE img ADD COLUMN IF NOT EXISTS user_id TEXT")
 
 
 def m(x):
@@ -41,38 +43,39 @@ def m(x):
     return f"{x:,.0f}" if x == int(x) else f"{x:,.2f}"
 
 
-def balances():
+def balances(uid):
     b = {"cash": 0.0, "transfer": 0.0}
     for w, v in q("SELECT wallet, COALESCE(SUM(CASE WHEN kind='in' THEN amount ELSE -amount END),0) "
-                  "FROM tx GROUP BY wallet"):
+                  "FROM tx WHERE user_id=%s GROUP BY wallet", (uid,)):
         b[w] = float(v)
     return b
 
 
-def bal_text():
-    b = balances()
+def bal_text(uid):
+    b = balances(uid)
     return (f"เงินสด {m(b['cash'])}฿\nเงินโอน {m(b['transfer'])}฿\n"
             f"รวม {m(b['cash'] + b['transfer'])}฿")
 
 
-def add(kind, wallet, amount, note):
-    r = q("SELECT id FROM img WHERE used=false AND ts > now() - interval '15 minutes' "
-          "ORDER BY id DESC LIMIT 1")
+def add(uid, kind, wallet, amount, note):
+    r = q("SELECT id FROM img WHERE user_id=%s AND used=false AND ts > now() - interval '15 minutes' "
+          "ORDER BY id DESC LIMIT 1", (uid,))
     img = r[0][0] if r else None
     if img:
         q("UPDATE img SET used=true WHERE id=%s", (img,))
-    tid = q("INSERT INTO tx(kind,wallet,amount,note,img_id) VALUES(%s,%s,%s,%s,%s) RETURNING id",
-            (kind, wallet, amount, note, img))[0][0]
+    tid = q("INSERT INTO tx(user_id,kind,wallet,amount,note,img_id) VALUES(%s,%s,%s,%s,%s,%s) "
+            "RETURNING id", (uid, kind, wallet, amount, note, img))[0][0]
     sign = "รับ" if kind == "in" else "จ่าย"
     pic = "\n📷 แนบรูปแล้ว" if img else ""
     return (f"บันทึกแล้ว #{tid}: {sign}{NAME[wallet]} {m(amount)}฿ ({note}){pic}"
-            f"\n\nคงเหลือ\n{bal_text()}")
+            f"\n\nคงเหลือ\n{bal_text(uid)}")
 
 
-def summary(month):
+def summary(uid, month):
     now = dt.datetime.now(TZ)
     start = now.replace(day=1 if month else now.day, hour=0, minute=0, second=0, microsecond=0)
-    rows = q("SELECT kind, wallet, SUM(amount) FROM tx WHERE ts >= %s GROUP BY kind, wallet", (start,))
+    rows = q("SELECT kind, wallet, SUM(amount) FROM tx WHERE user_id=%s AND ts >= %s "
+             "GROUP BY kind, wallet", (uid, start))
     d = {(k, w): float(v) for k, w, v in rows}
     inc = sum(v for (k, _), v in d.items() if k == "in")
     out = sum(v for (k, _), v in d.items() if k == "out")
@@ -81,7 +84,7 @@ def summary(month):
     t += f"- จ่ายเงินสด {m(d.get(('out', 'cash'), 0))}฿\n- จ่ายเงินโอน {m(d.get(('out', 'transfer'), 0))}฿"
     if not month:
         items = q("SELECT id, ts, kind, wallet, amount, note, img_id FROM tx "
-                  "WHERE ts >= %s ORDER BY ts", (start,))
+                  "WHERE user_id=%s AND ts >= %s ORDER BY ts", (uid, start))
         if items:
             t += "\n\nรายการ\n" + "\n".join(
                 f"#{r[0]} {r[1].astimezone(TZ):%H:%M} {'+' if r[2] == 'in' else '-'}{m(r[4])} "
@@ -95,10 +98,11 @@ def reply(tok, text):
                   json={"replyToken": tok, "messages": [{"type": "text", "text": text[:4900]}]})
 
 
-def show_pic(tok, n):
-    r = q("SELECT i.token FROM tx t JOIN img i ON i.id = t.img_id WHERE t.id=%s", (n,))
+def show_pic(tok, uid, n):
+    r = q("SELECT i.token FROM tx t JOIN img i ON i.id = t.img_id "
+          "WHERE t.id=%s AND t.user_id=%s", (n, uid))
     if not r:
-        return reply(tok, "รายการนี้ไม่มีรูปแนบ")
+        return reply(tok, "รายการนี้ไม่มีรูปแนบ (หรือรูปถูกลบเพราะเก่าเกินไปแล้ว)")
     url = f"{BASE}/img/{r[0][0]}"
     requests.post("https://api.line.me/v2/bot/message/reply", headers=H, timeout=15,
                   json={"replyToken": tok, "messages": [
@@ -106,40 +110,38 @@ def show_pic(tok, n):
 
 
 def handle(e):
-    uid = e["source"].get("userId", "")
+    uid = e["source"].get("userId")
+    if not uid:
+        return
     tok, msg = e["replyToken"], e["message"]
     if msg["type"] == "text":
         t = msg["text"].strip()
-        if t.lower() == "myid":
-            return reply(tok, uid)
-        if OWNER and uid != OWNER:
-            return
         for rx, kind in ((RE_IN, "in"), (RE_OUT, "out")):
             mt = rx.match(t)
             if mt:
                 note = mt.group(2) or ("รายรับ" if kind == "in" else "รายจ่าย")
-                return reply(tok, add(kind, W[mt.group(1)], float(mt.group(3).replace(",", "")), note))
+                amt = float(mt.group(3).replace(",", ""))
+                return reply(tok, add(uid, kind, W[mt.group(1)], amt, note))
         mp = RE_PIC.match(t)
         if mp:
-            return show_pic(tok, int(mp.group(1)))
+            return show_pic(tok, uid, int(mp.group(1)))
         if "ยอดคงเหลือ" in t:
-            return reply(tok, bal_text())
+            return reply(tok, bal_text(uid))
         if "สรุปเดือน" in t:
-            return reply(tok, summary(True))
+            return reply(tok, summary(uid, True))
         if "รายการวันนี้" in t or "สรุปวันนี้" in t:
-            return reply(tok, summary(False))
+            return reply(tok, summary(uid, False))
         return reply(tok, "คำสั่งที่ใช้ได้\n- ส่งรูป แล้วพิมพ์ต่อ เช่น\n  จ่ายเงินโอน ค่าข้าว 120\n"
                           "  จ่ายเงินสด ข้าวไข่เจียว 50\n- รับเงินโอน 100 / รับเงินสด 500\n"
                           "- ยอดคงเหลือ\n- รายการวันนี้\n- สรุปเดือนนี้\n- ดูรูป #เลขรายการ")
     if msg["type"] == "image":
-        if OWNER and uid != OWNER:
-            return
         r = requests.get(f"https://api-data.line.me/v2/bot/message/{msg['id']}/content",
                          headers=H, timeout=20)
         r.raise_for_status()
         ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-        q("INSERT INTO img(data, ctype, token) VALUES(%s,%s,%s)",
-          (psycopg2.Binary(r.content), ct, secrets.token_urlsafe(16)))
+        q("DELETE FROM img WHERE ts < now() - (%s * interval '1 day')", (KEEP_DAYS,))
+        q("INSERT INTO img(user_id, data, ctype, token) VALUES(%s,%s,%s,%s)",
+          (uid, psycopg2.Binary(r.content), ct, secrets.token_urlsafe(16)))
         return reply(tok, "เก็บรูปแล้ว ✅\nพิมพ์รายการต่อภายใน 15 นาที เช่น\nจ่ายเงินโอน ค่าข้าว 120")
 
 
